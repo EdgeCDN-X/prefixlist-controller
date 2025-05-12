@@ -1,8 +1,8 @@
 # edgecdnx-prefixlist-controller
-// TODO(user): Add simple overview of use/purpose
+PrefixList controller's purpose to consolidate and clean up redundant prefixes and rollout via ArgoCD
 
 ## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+PrefixList Controller manages destinations from multiple sources. It makes sure prefixes are not overlapping and are consolidated. Multiple sources can be used for the same region.
 
 ## Getting Started
 
@@ -89,7 +89,7 @@ Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
 the project, i.e.:
 
 ```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/edgecdnx-prefixlist-controller/<tag or branch>/dist/install.yaml
+kubectl apply -f https://raw.githubusercontent.com/<org>/prefixlist-controller/<tag or branch>/dist/install.yaml
 ```
 
 ### By providing a Helm Chart
