@@ -51,7 +51,14 @@ var _ = Describe("PrefixList Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: edgecdnxv1alpha1.PrefixListSpec{
+						Source:      "Static",
+						Destination: "eu-west-1",
+						Prefix: edgecdnxv1alpha1.Prefix{
+							V4: []edgecdnxv1alpha1.V4Prefix{},
+							V6: []edgecdnxv1alpha1.V6Prefix{},
+						},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
