@@ -48,6 +48,266 @@ const ConsoliadtionStatusConsolidated = "Consolidated"
 const HealthStatusHealthy = "Healthy"
 const HealthStatusProgressing = "Progressing"
 
+const SourceController = "Controller"
+
+func (r *PrefixListReconciler) handleControllerPrefixList(prefixList *edgecdnxv1alpha1.PrefixList, ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	if !prefixList.ObjectMeta.DeletionTimestamp.IsZero() {
+		// The object is being deleted
+		if controllerutil.ContainsFinalizer(prefixList, PrefixListFinalizer) {
+			log.Info("Deleting Controller managed PrefixList. This is not really a common operation. We will request a recalculation of the prefix list")
+			controllerutil.RemoveFinalizer(prefixList, PrefixListFinalizer)
+
+			err := r.Update(ctx, prefixList)
+			if err != nil {
+				log.Error(err, "Failed to remove finalizer")
+				return ctrl.Result{}, err
+			}
+
+			return ctrl.Result{Requeue: true}, nil
+		}
+	}
+
+	if prefixList.Status != (edgecdnxv1alpha1.PrefixListStatus{}) {
+		if prefixList.Status.Status == HealthStatusProgressing && prefixList.Status.ConsoliadtionStatus == ConsoliadtionStatusRequested {
+			log.Info("Prefix Recalculation requested for Controller managed PrefixList")
+
+			prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
+				Status:              HealthStatusProgressing,
+				ConsoliadtionStatus: ConsoliadtionStatusConsolidating,
+			}
+
+			err := r.Status().Update(context.Background(), prefixList)
+			if err != nil {
+				log.Error(err, "Failed to update PrefixList status")
+				return ctrl.Result{}, err
+			}
+
+			prefixListList := &edgecdnxv1alpha1.PrefixListList{}
+			err = r.List(ctx, prefixListList, client.InNamespace(req.Namespace))
+
+			if err != nil {
+				log.Error(err, "Failed to list PrefixList")
+				return ctrl.Result{}, err
+			}
+
+			v4Prefixes := make([]edgecdnxv1alpha1.V4Prefix, 0)
+			// v6Prefixes := make([]edgecdnxv1alpha1.V6Prefix, 0)
+			for _, prefix := range prefixListList.Items {
+				if prefix.Spec.Source != SourceController && prefix.Spec.Destination == prefixList.Spec.Destination {
+					v4Prefixes = append(v4Prefixes, prefix.Spec.Prefix.V4...)
+					// v6Prefixes = append(v6Prefixes, prefix.Spec.Prefix.V6...)
+				}
+			}
+
+			newPrefixes, err := consolidation.ConsolidateV4(ctx, v4Prefixes)
+			if err != nil {
+				log.Error(err, "Failed to consolidate prefixes")
+				return ctrl.Result{}, err
+			}
+			prefixList.Spec.Prefix.V4 = newPrefixes
+
+			err = r.Update(ctx, prefixList)
+			if err != nil {
+				log.Error(err, "Failed to update PrefixList")
+				return ctrl.Result{}, err
+			}
+
+			prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
+				Status:              HealthStatusProgressing,
+				ConsoliadtionStatus: ConsoliadtionStatusConsolidated,
+			}
+
+			err = r.Status().Update(context.Background(), prefixList)
+			if err != nil {
+				log.Error(err, "Failed to update PrefixList status")
+				return ctrl.Result{}, err
+			}
+
+			return ctrl.Result{}, nil
+		}
+		if prefixList.Status.Status == HealthStatusProgressing && prefixList.Status.ConsoliadtionStatus == ConsoliadtionStatusConsolidating {
+			log.Info("Prefix Recalculation in progress Skipping reconciliation")
+			return ctrl.Result{}, nil
+		}
+		if prefixList.Status.Status == HealthStatusProgressing && prefixList.Status.ConsoliadtionStatus == ConsoliadtionStatusConsolidated {
+			log.Info("Prefix Recalculation completed for Controller managed PrefixList")
+			prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
+				Status:              HealthStatusHealthy,
+				ConsoliadtionStatus: ConsoliadtionStatusConsolidated,
+			}
+
+			err := r.Status().Update(context.Background(), prefixList)
+			if err != nil {
+				log.Error(err, "Failed to update PrefixList status")
+				return ctrl.Result{}, err
+			}
+		}
+		if prefixList.Status.Status == HealthStatusHealthy && prefixList.Status.ConsoliadtionStatus == ConsoliadtionStatusConsolidated {
+			log.Info("PrefixList is healthy, Rolling it out via Argocd")
+
+			// TODO, Implement argocd rollout
+		}
+	} else {
+		prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
+			Status:              HealthStatusProgressing,
+			ConsoliadtionStatus: ConsoliadtionStatusRequested,
+		}
+
+		err := r.Status().Update(context.Background(), prefixList)
+		if err != nil {
+			log.Error(err, "Failed to update PrefixList status")
+			return ctrl.Result{}, err
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *PrefixListReconciler) handleUserPrefixList(prefixList *edgecdnxv1alpha1.PrefixList, ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	// Static and BGP Chain
+	generatedName := fmt.Sprintf("%s-%s", prefixList.Spec.Destination, "generated")
+
+	if !prefixList.ObjectMeta.DeletionTimestamp.IsZero() {
+		// The object is being deleted
+		if controllerutil.ContainsFinalizer(prefixList, PrefixListFinalizer) {
+			log.Info("Deleting PrefixList")
+			controllerutil.RemoveFinalizer(prefixList, PrefixListFinalizer)
+			err := r.Update(ctx, prefixList)
+			if err != nil {
+				log.Error(err, "Failed to remove finalizer")
+				return ctrl.Result{}, err
+			}
+		}
+
+		// Make sure we call the regeneration
+		generatedPrefixList := &edgecdnxv1alpha1.PrefixList{}
+		err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: generatedName}, generatedPrefixList)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+
+		generatedPrefixList.Status.Status = HealthStatusProgressing
+		generatedPrefixList.Status.ConsoliadtionStatus = ConsoliadtionStatusRequested
+		err = r.Status().Update(context.Background(), generatedPrefixList)
+		if err != nil {
+			log.Error(err, "Failed to update status of generated PrefixList")
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	if prefixList.Status != (edgecdnxv1alpha1.PrefixListStatus{}) {
+		if prefixList.Status.Status == HealthStatusHealthy {
+			generatedPrefixList := &edgecdnxv1alpha1.PrefixList{}
+			// Find object by destination. We are consolidating the prefix list here
+			err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: generatedName}, generatedPrefixList)
+			if err != nil && apierrors.IsNotFound(err) {
+				log.Info("PrefixList does not exist for destination, creating one")
+				nPrefixList := &edgecdnxv1alpha1.PrefixList{
+					ObjectMeta: ctrl.ObjectMeta{
+						Name:      generatedName,
+						Namespace: req.Namespace,
+					},
+					Spec: edgecdnxv1alpha1.PrefixListSpec{
+						Source: SourceController,
+						Prefix: edgecdnxv1alpha1.Prefix{
+							V4: make([]edgecdnxv1alpha1.V4Prefix, 0),
+							V6: make([]edgecdnxv1alpha1.V6Prefix, 0),
+						},
+						Destination: prefixList.Spec.Destination,
+					},
+				}
+
+				if !controllerutil.ContainsFinalizer(nPrefixList, PrefixListFinalizer) {
+					controllerutil.AddFinalizer(nPrefixList, PrefixListFinalizer)
+				}
+
+				err := r.Create(ctx, nPrefixList)
+
+				if err != nil {
+					log.Error(err, "Failed to create PrefixList")
+					return ctrl.Result{}, err
+				}
+
+				log.Info("PrefixList created for destination")
+				return ctrl.Result{}, nil
+			} else {
+				log.Info("PrefixList already exists for destination, Triggering Reconciliation")
+				// Update the consolidated prefix list with the new prefixes
+				generatedPrefixList.Status.Status = HealthStatusProgressing
+				generatedPrefixList.Status.ConsoliadtionStatus = ConsoliadtionStatusRequested
+
+				err := r.Status().Update(context.Background(), generatedPrefixList)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+
+				return ctrl.Result{}, nil
+			}
+		}
+	}
+
+	log.Info("PrefixList status is nil, resource just created. Setting status to Healthy")
+	prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
+		Status: HealthStatusHealthy,
+	}
+
+	err := r.Status().Update(context.Background(), prefixList)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if !controllerutil.ContainsFinalizer(prefixList, PrefixListFinalizer) {
+		controllerutil.AddFinalizer(prefixList, PrefixListFinalizer)
+		err = r.Update(ctx, prefixList)
+		if err != nil {
+			log.Error(err, "Failed to add finalizer")
+			return ctrl.Result{}, err
+		}
+	}
+
+	return ctrl.Result{}, nil
+
+}
+
+func (r *PrefixListReconciler) forceSync(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	log.Info("Running triggers, see if we need to trigger a regeneration")
+	prefixListList := &edgecdnxv1alpha1.PrefixListList{}
+	err := r.List(ctx, prefixListList, client.InNamespace(req.Namespace))
+
+	if err != nil {
+		log.Error(err, "Failed to list PrefixList")
+		return ctrl.Result{}, err
+	}
+
+	notFoundList := make([]string, 0)
+
+	for _, prefixList := range prefixListList.Items {
+		if prefixList.Spec.Source != SourceController {
+
+			if !slices.ContainsFunc(prefixListList.Items, func(item edgecdnxv1alpha1.PrefixList) bool {
+				return item.Spec.Source == SourceController && prefixList.Spec.Destination == item.Spec.Destination && !slices.Contains(notFoundList, prefixList.Spec.Destination)
+			}) {
+				notFoundList = append(notFoundList, prefixList.Spec.Destination)
+				prefixList.Status.Status = HealthStatusProgressing
+				err = r.Status().Update(context.Background(), &prefixList)
+				if err != nil {
+					return ctrl.Result{}, err
+				}
+			}
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
 // +kubebuilder:rbac:groups=edgecdnx.edgecdnx.com,resources=prefixlists,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=edgecdnx.edgecdnx.com,resources=prefixlists/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=edgecdnx.edgecdnx.com,resources=prefixlists/finalizers,verbs=update
@@ -71,258 +331,18 @@ func (r *PrefixListReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Info("PrefixList resource not found. Ignoring since object must be deleted.")
-
-			log.Info("Running triggers, see if we need to trigger a regeneration")
-			prefixListList := &edgecdnxv1alpha1.PrefixListList{}
-			err := r.List(ctx, prefixListList, client.InNamespace(req.Namespace))
-
-			if err != nil {
-				log.Error(err, "Failed to list PrefixList")
-				return ctrl.Result{}, err
-			}
-
-			notFoundList := make([]string, 0)
-
-			for _, prefixList := range prefixListList.Items {
-				if prefixList.Spec.Source != "Controller" {
-
-					if !slices.ContainsFunc(prefixListList.Items, func(item edgecdnxv1alpha1.PrefixList) bool {
-						return item.Spec.Source == "Controller" && prefixList.Spec.Destination == item.Spec.Destination && !slices.Contains(notFoundList, prefixList.Spec.Destination)
-					}) {
-						notFoundList = append(notFoundList, prefixList.Spec.Destination)
-						prefixList.Status.Status = HealthStatusProgressing
-						err = r.Status().Update(context.Background(), &prefixList)
-						if err != nil {
-							return ctrl.Result{}, err
-						}
-					}
-
-				}
-			}
-
-			return ctrl.Result{}, nil
+			return r.forceSync(ctx, req)
 		}
 		log.Error(err, "Failed to get PrefixList")
 		return ctrl.Result{}, err
 	}
 
 	if prefixList.Spec.Source == "Static" || prefixList.Spec.Source == "Bgp" {
-		// Static and BGP Chain
-		generatedName := fmt.Sprintf("%s-%s", prefixList.Spec.Destination, "generated")
-
-		if !prefixList.ObjectMeta.DeletionTimestamp.IsZero() {
-			// The object is being deleted
-			if controllerutil.ContainsFinalizer(prefixList, PrefixListFinalizer) {
-				log.Info("Deleting PrefixList")
-				controllerutil.RemoveFinalizer(prefixList, PrefixListFinalizer)
-				err := r.Update(ctx, prefixList)
-				if err != nil {
-					log.Error(err, "Failed to remove finalizer")
-					return ctrl.Result{}, err
-				}
-			}
-
-			// Make sure we call the regeneration
-			generatedPrefixList := &edgecdnxv1alpha1.PrefixList{}
-			err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: generatedName}, generatedPrefixList)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-
-			generatedPrefixList.Status.Status = HealthStatusProgressing
-			generatedPrefixList.Status.ConsoliadtionStatus = ConsoliadtionStatusRequested
-			err = r.Status().Update(context.Background(), generatedPrefixList)
-			if err != nil {
-				log.Error(err, "Failed to update status of generated PrefixList")
-				return ctrl.Result{}, err
-			}
-
-			return ctrl.Result{}, nil
-		}
-
-		if prefixList.Status != (edgecdnxv1alpha1.PrefixListStatus{}) {
-			if prefixList.Status.Status == HealthStatusHealthy {
-				generatedPrefixList := &edgecdnxv1alpha1.PrefixList{}
-				// Find object by destination. We are consolidating the prefix list here
-				err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: generatedName}, generatedPrefixList)
-				if err != nil && apierrors.IsNotFound(err) {
-					log.Info("PrefixList does not exist for destination, creating one")
-					nPrefixList := &edgecdnxv1alpha1.PrefixList{
-						ObjectMeta: ctrl.ObjectMeta{
-							Name:      generatedName,
-							Namespace: req.Namespace,
-						},
-						Spec: edgecdnxv1alpha1.PrefixListSpec{
-							Source: "Controller",
-							Prefix: edgecdnxv1alpha1.Prefix{
-								V4: make([]edgecdnxv1alpha1.V4Prefix, 0),
-								V6: make([]edgecdnxv1alpha1.V6Prefix, 0),
-							},
-							Destination: prefixList.Spec.Destination,
-						},
-					}
-
-					if !controllerutil.ContainsFinalizer(nPrefixList, PrefixListFinalizer) {
-						controllerutil.AddFinalizer(nPrefixList, PrefixListFinalizer)
-					}
-
-					err := r.Create(ctx, nPrefixList)
-
-					if err != nil {
-						log.Error(err, "Failed to create PrefixList")
-						return ctrl.Result{}, err
-					}
-
-					log.Info("PrefixList created for destination")
-					return ctrl.Result{}, nil
-				} else {
-					log.Info("PrefixList already exists for destination, Triggering Reconciliation")
-					// Update the consolidated prefix list with the new prefixes
-					generatedPrefixList.Status.Status = HealthStatusProgressing
-					generatedPrefixList.Status.ConsoliadtionStatus = ConsoliadtionStatusRequested
-
-					err := r.Status().Update(context.Background(), generatedPrefixList)
-					if err != nil {
-						return ctrl.Result{}, err
-					}
-
-					return ctrl.Result{}, nil
-				}
-			}
-		}
-
-		log.Info("PrefixList status is nil, resource just created. Setting status to Healthy")
-		prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
-			Status: HealthStatusHealthy,
-		}
-
-		err := r.Status().Update(context.Background(), prefixList)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-
-		if !controllerutil.ContainsFinalizer(prefixList, PrefixListFinalizer) {
-			controllerutil.AddFinalizer(prefixList, PrefixListFinalizer)
-			err = r.Update(ctx, prefixList)
-			if err != nil {
-				log.Error(err, "Failed to add finalizer")
-				return ctrl.Result{}, err
-			}
-		}
-
-		return ctrl.Result{}, nil
+		return r.handleUserPrefixList(prefixList, ctx, req)
 	}
 
-	if prefixList.Spec.Source == "Controller" {
-
-		if !prefixList.ObjectMeta.DeletionTimestamp.IsZero() {
-			// The object is being deleted
-			if controllerutil.ContainsFinalizer(prefixList, PrefixListFinalizer) {
-				log.Info("Deleting Controller managed PrefixList. This is not really a common operation. We will request a recalculation of the prefix list")
-				controllerutil.RemoveFinalizer(prefixList, PrefixListFinalizer)
-
-				err := r.Update(ctx, prefixList)
-				if err != nil {
-					log.Error(err, "Failed to remove finalizer")
-					return ctrl.Result{}, err
-				}
-
-				return ctrl.Result{Requeue: true}, nil
-			}
-		}
-
-		if prefixList.Status != (edgecdnxv1alpha1.PrefixListStatus{}) {
-			if prefixList.Status.Status == HealthStatusProgressing && prefixList.Status.ConsoliadtionStatus == ConsoliadtionStatusRequested {
-				log.Info("Prefix Recalculation requested for Controller managed PrefixList")
-
-				prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
-					Status:              HealthStatusProgressing,
-					ConsoliadtionStatus: ConsoliadtionStatusConsolidating,
-				}
-
-				err = r.Status().Update(context.Background(), prefixList)
-				if err != nil {
-					log.Error(err, "Failed to update PrefixList status")
-					return ctrl.Result{}, err
-				}
-
-				prefixListList := &edgecdnxv1alpha1.PrefixListList{}
-				err = r.List(ctx, prefixListList, client.InNamespace(req.Namespace))
-
-				if err != nil {
-					log.Error(err, "Failed to list PrefixList")
-					return ctrl.Result{}, err
-				}
-
-				v4Prefixes := make([]edgecdnxv1alpha1.V4Prefix, 0)
-				// v6Prefixes := make([]edgecdnxv1alpha1.V6Prefix, 0)
-				for _, prefix := range prefixListList.Items {
-					if prefix.Spec.Source != "Controller" && prefix.Spec.Destination == prefixList.Spec.Destination {
-						v4Prefixes = append(v4Prefixes, prefix.Spec.Prefix.V4...)
-						// v6Prefixes = append(v6Prefixes, prefix.Spec.Prefix.V6...)
-					}
-				}
-
-				newPrefixes, err := consolidation.ConsolidateV4(ctx, v4Prefixes)
-				if err != nil {
-					log.Error(err, "Failed to consolidate prefixes")
-					return ctrl.Result{}, err
-				}
-				prefixList.Spec.Prefix.V4 = newPrefixes
-
-				err = r.Update(ctx, prefixList)
-				if err != nil {
-					log.Error(err, "Failed to update PrefixList")
-					return ctrl.Result{}, err
-				}
-
-				prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
-					Status:              HealthStatusProgressing,
-					ConsoliadtionStatus: ConsoliadtionStatusConsolidated,
-				}
-
-				err = r.Status().Update(context.Background(), prefixList)
-				if err != nil {
-					log.Error(err, "Failed to update PrefixList status")
-					return ctrl.Result{}, err
-				}
-
-				return ctrl.Result{}, nil
-			}
-			if prefixList.Status.Status == HealthStatusProgressing && prefixList.Status.ConsoliadtionStatus == ConsoliadtionStatusConsolidating {
-				log.Info("Prefix Recalculation in progress Skipping reconciliation")
-				return ctrl.Result{}, nil
-			}
-			if prefixList.Status.Status == HealthStatusProgressing && prefixList.Status.ConsoliadtionStatus == ConsoliadtionStatusConsolidated {
-				log.Info("Prefix Recalculation completed for Controller managed PrefixList")
-				prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
-					Status:              HealthStatusHealthy,
-					ConsoliadtionStatus: ConsoliadtionStatusConsolidated,
-				}
-
-				err = r.Status().Update(context.Background(), prefixList)
-				if err != nil {
-					log.Error(err, "Failed to update PrefixList status")
-					return ctrl.Result{}, err
-				}
-			}
-			if prefixList.Status.Status == HealthStatusHealthy && prefixList.Status.ConsoliadtionStatus == ConsoliadtionStatusConsolidated {
-				log.Info("PrefixList is healthy, Rolling it out via Argocd")
-
-				// TODO, Implement argocd rollout
-			}
-		} else {
-			prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
-				Status:              HealthStatusProgressing,
-				ConsoliadtionStatus: ConsoliadtionStatusRequested,
-			}
-
-			err := r.Status().Update(context.Background(), prefixList)
-			if err != nil {
-				log.Error(err, "Failed to update PrefixList status")
-				return ctrl.Result{}, err
-			}
-		}
+	if prefixList.Spec.Source == SourceController {
+		return r.handleControllerPrefixList(prefixList, ctx, req)
 	}
 
 	return ctrl.Result{}, nil
