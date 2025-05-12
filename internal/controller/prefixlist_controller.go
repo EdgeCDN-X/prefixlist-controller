@@ -41,6 +41,13 @@ type PrefixListReconciler struct {
 
 const PrefixListFinalizer = "prefixlist.edgecdnx.com/finalizer"
 
+const ConsoliadtionStatusRequested = "Requested"
+const ConsoliadtionStatusConsolidating = "Consolidating"
+const ConsoliadtionStatusConsolidated = "Consolidated"
+
+const HealthStatusHealthy = "Healthy"
+const HealthStatusProgressing = "Progressing"
+
 // +kubebuilder:rbac:groups=edgecdnx.edgecdnx.com,resources=prefixlists,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=edgecdnx.edgecdnx.com,resources=prefixlists/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=edgecdnx.edgecdnx.com,resources=prefixlists/finalizers,verbs=update
@@ -67,7 +74,12 @@ func (r *PrefixListReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 			log.Info("Running triggers, see if we need to trigger a regeneration")
 			prefixListList := &edgecdnxv1alpha1.PrefixListList{}
-			r.List(ctx, prefixListList, client.InNamespace(req.Namespace))
+			err := r.List(ctx, prefixListList, client.InNamespace(req.Namespace))
+
+			if err != nil {
+				log.Error(err, "Failed to list PrefixList")
+				return ctrl.Result{}, err
+			}
 
 			notFoundList := make([]string, 0)
 
@@ -78,7 +90,7 @@ func (r *PrefixListReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 						return item.Spec.Source == "Controller" && prefixList.Spec.Destination == item.Spec.Destination && !slices.Contains(notFoundList, prefixList.Spec.Destination)
 					}) {
 						notFoundList = append(notFoundList, prefixList.Spec.Destination)
-						prefixList.Status.Status = "Progressing"
+						prefixList.Status.Status = HealthStatusProgressing
 						err = r.Status().Update(context.Background(), &prefixList)
 						if err != nil {
 							return ctrl.Result{}, err
@@ -117,8 +129,8 @@ func (r *PrefixListReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				return ctrl.Result{}, err
 			}
 
-			generatedPrefixList.Status.Status = "Progressing"
-			generatedPrefixList.Status.ConsoliadtionStatus = "Requested"
+			generatedPrefixList.Status.Status = HealthStatusProgressing
+			generatedPrefixList.Status.ConsoliadtionStatus = ConsoliadtionStatusRequested
 			err = r.Status().Update(context.Background(), generatedPrefixList)
 			if err != nil {
 				log.Error(err, "Failed to update status of generated PrefixList")
@@ -129,7 +141,7 @@ func (r *PrefixListReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 
 		if prefixList.Status != (edgecdnxv1alpha1.PrefixListStatus{}) {
-			if prefixList.Status.Status == "Healthy" {
+			if prefixList.Status.Status == HealthStatusHealthy {
 				generatedPrefixList := &edgecdnxv1alpha1.PrefixList{}
 				// Find object by destination. We are consolidating the prefix list here
 				err = r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: generatedName}, generatedPrefixList)
@@ -166,8 +178,8 @@ func (r *PrefixListReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				} else {
 					log.Info("PrefixList already exists for destination, Triggering Reconciliation")
 					// Update the consolidated prefix list with the new prefixes
-					generatedPrefixList.Status.Status = "Progressing"
-					generatedPrefixList.Status.ConsoliadtionStatus = "Requested"
+					generatedPrefixList.Status.Status = HealthStatusProgressing
+					generatedPrefixList.Status.ConsoliadtionStatus = ConsoliadtionStatusRequested
 
 					err := r.Status().Update(context.Background(), generatedPrefixList)
 					if err != nil {
@@ -181,7 +193,7 @@ func (r *PrefixListReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 		log.Info("PrefixList status is nil, resource just created. Setting status to Healthy")
 		prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
-			Status: "Healthy",
+			Status: HealthStatusHealthy,
 		}
 
 		err := r.Status().Update(context.Background(), prefixList)
@@ -220,12 +232,12 @@ func (r *PrefixListReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		}
 
 		if prefixList.Status != (edgecdnxv1alpha1.PrefixListStatus{}) {
-			if prefixList.Status.Status == "Progressing" && prefixList.Status.ConsoliadtionStatus == "Requested" {
+			if prefixList.Status.Status == HealthStatusProgressing && prefixList.Status.ConsoliadtionStatus == ConsoliadtionStatusRequested {
 				log.Info("Prefix Recalculation requested for Controller managed PrefixList")
 
 				prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
-					Status:              "Progressing",
-					ConsoliadtionStatus: "Consolidating",
+					Status:              HealthStatusProgressing,
+					ConsoliadtionStatus: ConsoliadtionStatusConsolidating,
 				}
 
 				err = r.Status().Update(context.Background(), prefixList)
@@ -265,8 +277,8 @@ func (r *PrefixListReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				}
 
 				prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
-					Status:              "Progressing",
-					ConsoliadtionStatus: "Consolidated",
+					Status:              HealthStatusProgressing,
+					ConsoliadtionStatus: ConsoliadtionStatusConsolidated,
 				}
 
 				err = r.Status().Update(context.Background(), prefixList)
@@ -277,15 +289,15 @@ func (r *PrefixListReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 				return ctrl.Result{}, nil
 			}
-			if prefixList.Status.Status == "Progressing" && prefixList.Status.ConsoliadtionStatus == "Consolidating" {
+			if prefixList.Status.Status == HealthStatusProgressing && prefixList.Status.ConsoliadtionStatus == ConsoliadtionStatusConsolidating {
 				log.Info("Prefix Recalculation in progress Skipping reconciliation")
 				return ctrl.Result{}, nil
 			}
-			if prefixList.Status.Status == "Progressing" && prefixList.Status.ConsoliadtionStatus == "Consolidated" {
+			if prefixList.Status.Status == HealthStatusProgressing && prefixList.Status.ConsoliadtionStatus == ConsoliadtionStatusConsolidated {
 				log.Info("Prefix Recalculation completed for Controller managed PrefixList")
 				prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
-					Status:              "Healthy",
-					ConsoliadtionStatus: "Consolidated",
+					Status:              HealthStatusHealthy,
+					ConsoliadtionStatus: ConsoliadtionStatusConsolidated,
 				}
 
 				err = r.Status().Update(context.Background(), prefixList)
@@ -294,15 +306,15 @@ func (r *PrefixListReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 					return ctrl.Result{}, err
 				}
 			}
-			if prefixList.Status.Status == "Healthy" && prefixList.Status.ConsoliadtionStatus == "Consolidated" {
+			if prefixList.Status.Status == HealthStatusHealthy && prefixList.Status.ConsoliadtionStatus == ConsoliadtionStatusConsolidated {
 				log.Info("PrefixList is healthy, Rolling it out via Argocd")
 
 				// TODO, Implement argocd rollout
 			}
 		} else {
 			prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
-				Status:              "Progressing",
-				ConsoliadtionStatus: "Requested",
+				Status:              HealthStatusProgressing,
+				ConsoliadtionStatus: ConsoliadtionStatusRequested,
 			}
 
 			err := r.Status().Update(context.Background(), prefixList)
