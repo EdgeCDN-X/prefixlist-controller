@@ -22,6 +22,7 @@ import (
 	"slices"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -50,6 +51,77 @@ const HealthStatusHealthy = "Healthy"
 const HealthStatusProgressing = "Progressing"
 
 const SourceController = "Controller"
+
+func (r *PrefixListReconciler) reconcileArgocdApplicationSet(prefixList *edgecdnxv1alpha1.PrefixList, ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	applicationsetName := fmt.Sprintf("%s-%s", prefixList.Spec.Destination, "routing-applicationset")
+	appsetFound := &argoprojv1alpha1.ApplicationSet{}
+
+	appSet := &argoprojv1alpha1.ApplicationSet{
+		ObjectMeta: ctrl.ObjectMeta{
+			Name:      applicationsetName,
+			Namespace: prefixList.Namespace,
+		},
+		Spec: argoprojv1alpha1.ApplicationSetSpec{
+			Generators: []argoprojv1alpha1.ApplicationSetGenerator{
+				{
+					Clusters: &argoprojv1alpha1.ClusterGenerator{
+						Selector: metav1.LabelSelector{
+							MatchExpressions: []metav1.LabelSelectorRequirement{
+								{
+									Key:      "edgecdnx.com/routing",
+									Operator: metav1.LabelSelectorOpIn,
+									Values:   []string{"yes", "true"},
+								},
+							},
+						},
+						Template: argoprojv1alpha1.ApplicationSetTemplate{},
+						Values: map[string]string{
+							"chart":        "myroutingchart",
+							"chartVersion": "1.0.0",
+						},
+					},
+				},
+			},
+			Template: argoprojv1alpha1.ApplicationSetTemplate{
+				ApplicationSetTemplateMeta: argoprojv1alpha1.ApplicationSetTemplateMeta{
+					Name: fmt.Sprintf("%s-%s", "{{ name }}-routing", prefixList.Spec.Destination),
+				},
+				Spec: argoprojv1alpha1.ApplicationSpec{
+					Project: "edgecdnx",
+					Destination: argoprojv1alpha1.ApplicationDestination{
+						Server:    "{{ server }}",
+						Namespace: "edgecdnx",
+					},
+					Sources: []argoprojv1alpha1.ApplicationSource{},
+				},
+			},
+		},
+	}
+	controllerutil.SetControllerReference(prefixList, appSet, r.Scheme)
+
+	err := r.Get(ctx, types.NamespacedName{Namespace: prefixList.Namespace, Name: applicationsetName}, appsetFound)
+	if err != nil && apierrors.IsNotFound(err) {
+		log.Info("ApplicationSet not found for destination. Creating one")
+
+		err := r.Create(ctx, appSet)
+		if err != nil {
+			log.Error(err, "Failed to create ApplicationSet")
+			return ctrl.Result{}, err
+		}
+		log.Info("ApplicationSet created for destination")
+		return ctrl.Result{}, nil
+	}
+
+	err = r.Update(ctx, appSet)
+	if err != nil {
+		log.Error(err, "Failed to update ApplicationSet")
+		return ctrl.Result{}, err
+	}
+	log.Info("ApplicationSet updated for destination")
+	return ctrl.Result{}, nil
+}
 
 func (r *PrefixListReconciler) handleControllerPrefixList(prefixList *edgecdnxv1alpha1.PrefixList, ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -148,15 +220,7 @@ func (r *PrefixListReconciler) handleControllerPrefixList(prefixList *edgecdnxv1
 		if prefixList.Status.Status == HealthStatusHealthy && prefixList.Status.ConsoliadtionStatus == ConsoliadtionStatusConsolidated {
 			log.Info("PrefixList is healthy, Rolling it out via Argocd")
 
-			// TODO, Implement argocd rollout
-
-			appsetFound := &argoprojv1alpha1.ApplicationSet{}
-			err := r.Get(ctx, types.NamespacedName{Namespace: prefixList.Namespace, Name: prefixList.Spec.Destination}, appsetFound)
-			if err != nil && apierrors.IsNotFound(err) {
-				log.Info("ApplicationSet not found, skipping reconciliation")
-				return ctrl.Result{}, nil
-			}
-
+			return r.reconcileArgocdApplicationSet(prefixList, ctx, req)
 		}
 	} else {
 		prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
@@ -363,6 +427,5 @@ func (r *PrefixListReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&edgecdnxv1alpha1.PrefixList{}).
 		Owns(&argoprojv1alpha1.ApplicationSet{}).
-		Named("prefixlist").
 		Complete(r)
 }
