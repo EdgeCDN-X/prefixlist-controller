@@ -39,6 +39,7 @@ import (
 
 	edgecdnxv1alpha1 "edgecdnx.com/prefixlist-controller/api/v1alpha1"
 	"edgecdnx.com/prefixlist-controller/internal/controller"
+	argoprojv1alpha1 "github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -51,6 +52,7 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(edgecdnxv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(argoprojv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 

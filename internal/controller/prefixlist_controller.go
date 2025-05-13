@@ -31,6 +31,7 @@ import (
 
 	edgecdnxv1alpha1 "edgecdnx.com/prefixlist-controller/api/v1alpha1"
 	"edgecdnx.com/prefixlist-controller/internal/consolidation"
+	argoprojv1alpha1 "github.com/argoproj/argo-cd/v2/pkg/apis/application/v1alpha1"
 )
 
 // PrefixListReconciler reconciles a PrefixList object
@@ -148,6 +149,14 @@ func (r *PrefixListReconciler) handleControllerPrefixList(prefixList *edgecdnxv1
 			log.Info("PrefixList is healthy, Rolling it out via Argocd")
 
 			// TODO, Implement argocd rollout
+
+			appsetFound := &argoprojv1alpha1.ApplicationSet{}
+			err := r.Get(ctx, types.NamespacedName{Namespace: prefixList.Namespace, Name: prefixList.Spec.Destination}, appsetFound)
+			if err != nil && apierrors.IsNotFound(err) {
+				log.Info("ApplicationSet not found, skipping reconciliation")
+				return ctrl.Result{}, nil
+			}
+
 		}
 	} else {
 		prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
@@ -311,6 +320,7 @@ func (r *PrefixListReconciler) forceSync(ctx context.Context, req ctrl.Request) 
 // +kubebuilder:rbac:groups=edgecdnx.edgecdnx.com,resources=prefixlists,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=edgecdnx.edgecdnx.com,resources=prefixlists/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=edgecdnx.edgecdnx.com,resources=prefixlists/finalizers,verbs=update
+// +kubebuilder:rbac:groups=argoproj.io,resources=applicationsets,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -352,6 +362,7 @@ func (r *PrefixListReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 func (r *PrefixListReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&edgecdnxv1alpha1.PrefixList{}).
+		Owns(&argoprojv1alpha1.ApplicationSet{}).
 		Named("prefixlist").
 		Complete(r)
 }
