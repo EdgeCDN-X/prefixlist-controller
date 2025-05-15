@@ -18,14 +18,16 @@ package controller
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/json"
 	"fmt"
-	"slices"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -41,10 +43,6 @@ type PrefixListReconciler struct {
 	Scheme *runtime.Scheme
 }
 
-const PrefixListFinalizer = "prefixlist.edgecdnx.com/finalizer"
-
-const ConsoliadtionStatusRequested = "Requested"
-const ConsoliadtionStatusConsolidating = "Consolidating"
 const ConsoliadtionStatusConsolidated = "Consolidated"
 
 const HealthStatusHealthy = "Healthy"
@@ -55,55 +53,90 @@ const SourceController = "Controller"
 func (r *PrefixListReconciler) reconcileArgocdApplicationSet(prefixList *edgecdnxv1alpha1.PrefixList, ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	applicationsetName := fmt.Sprintf("%s-%s", prefixList.Spec.Destination, "routing-applicationset")
+	applicationsetName := fmt.Sprintf("%s-%s", prefixList.Spec.Destination, "routing")
 	appsetFound := &argoprojv1alpha1.ApplicationSet{}
 
-	appSet := &argoprojv1alpha1.ApplicationSet{
-		ObjectMeta: ctrl.ObjectMeta{
-			Name:      applicationsetName,
-			Namespace: prefixList.Namespace,
+	valuesObject, err := json.Marshal(map[string]interface{}{
+		"routing": map[string]interface{}{
+			"location": prefixList.Spec.Destination,
+			"prefix": map[string]interface{}{
+				"v4": prefixList.Spec.Prefix.V4,
+				"v6": prefixList.Spec.Prefix.V6,
+			},
 		},
-		Spec: argoprojv1alpha1.ApplicationSetSpec{
-			Generators: []argoprojv1alpha1.ApplicationSetGenerator{
-				{
-					Clusters: &argoprojv1alpha1.ClusterGenerator{
-						Selector: metav1.LabelSelector{
-							MatchExpressions: []metav1.LabelSelectorRequirement{
-								{
-									Key:      "edgecdnx.com/routing",
-									Operator: metav1.LabelSelectorOpIn,
-									Values:   []string{"yes", "true"},
-								},
+	})
+
+	hash := md5.Sum(valuesObject)
+
+	if err != nil {
+		log.Error(err, "Failed to marshal values object")
+		return ctrl.Result{}, err
+	}
+
+	specObj := argoprojv1alpha1.ApplicationSetSpec{
+		Generators: []argoprojv1alpha1.ApplicationSetGenerator{
+			{
+				Clusters: &argoprojv1alpha1.ClusterGenerator{
+					Selector: metav1.LabelSelector{
+						MatchExpressions: []metav1.LabelSelectorRequirement{
+							{
+								Key:      "edgecdnx.com/routing",
+								Operator: metav1.LabelSelectorOpIn,
+								Values:   []string{"yes", "true"},
 							},
 						},
-						Template: argoprojv1alpha1.ApplicationSetTemplate{},
-						Values: map[string]string{
-							"chart":        "myroutingchart",
-							"chartVersion": "1.0.0",
-						},
+					},
+					Values: map[string]string{
+						// TODO make these configurable
+						"chartRepository": "https://edgecdn-x.github.io/helm-charts",
+						"chart":           "routing-config",
+						"chartVersion":    "0.1.0",
 					},
 				},
 			},
-			Template: argoprojv1alpha1.ApplicationSetTemplate{
-				ApplicationSetTemplateMeta: argoprojv1alpha1.ApplicationSetTemplateMeta{
-					Name: fmt.Sprintf("%s-%s", "{{ name }}-routing", prefixList.Spec.Destination),
+		},
+		Template: argoprojv1alpha1.ApplicationSetTemplate{
+			ApplicationSetTemplateMeta: argoprojv1alpha1.ApplicationSetTemplateMeta{
+				Name: fmt.Sprintf("%s-%s", "{{ name }}-routing", prefixList.Spec.Destination),
+			},
+			Spec: argoprojv1alpha1.ApplicationSpec{
+				Project: "edgecdnx",
+				Destination: argoprojv1alpha1.ApplicationDestination{
+					Server:    "{{ server }}",
+					Namespace: req.Namespace,
 				},
-				Spec: argoprojv1alpha1.ApplicationSpec{
-					Project: "edgecdnx",
-					Destination: argoprojv1alpha1.ApplicationDestination{
-						Server:    "{{ server }}",
-						Namespace: "edgecdnx",
+				Sources: []argoprojv1alpha1.ApplicationSource{
+					{
+						Chart:          "{{ values.chart }}",
+						RepoURL:        "{{ values.chartRepository }}",
+						TargetRevision: "{{ values.chartVersion }}",
+						Helm: &argoprojv1alpha1.ApplicationSourceHelm{
+							ReleaseName: "{{ name }}",
+							ValuesObject: &runtime.RawExtension{
+								Raw: valuesObject,
+							},
+						},
 					},
-					Sources: []argoprojv1alpha1.ApplicationSource{},
 				},
 			},
 		},
 	}
-	controllerutil.SetControllerReference(prefixList, appSet, r.Scheme)
 
-	err := r.Get(ctx, types.NamespacedName{Namespace: prefixList.Namespace, Name: applicationsetName}, appsetFound)
+	err = r.Get(ctx, types.NamespacedName{Namespace: prefixList.Namespace, Name: applicationsetName}, appsetFound)
 	if err != nil && apierrors.IsNotFound(err) {
 		log.Info("ApplicationSet not found for destination. Creating one")
+
+		appSet := &argoprojv1alpha1.ApplicationSet{
+			ObjectMeta: ctrl.ObjectMeta{
+				Name:      applicationsetName,
+				Namespace: prefixList.Namespace,
+				Labels: map[string]string{
+					"edgecdnx.com/config-md5": fmt.Sprintf("%x", hash),
+				},
+			},
+			Spec: specObj,
+		}
+		controllerutil.SetControllerReference(prefixList, appSet, r.Scheme)
 
 		err := r.Create(ctx, appSet)
 		if err != nil {
@@ -114,168 +147,36 @@ func (r *PrefixListReconciler) reconcileArgocdApplicationSet(prefixList *edgecdn
 		return ctrl.Result{}, nil
 	}
 
-	err = r.Update(ctx, appSet)
-	if err != nil {
-		log.Error(err, "Failed to update ApplicationSet")
-		return ctrl.Result{}, err
-	}
-	log.Info("ApplicationSet updated for destination")
-	return ctrl.Result{}, nil
-}
-
-func (r *PrefixListReconciler) handleControllerPrefixList(prefixList *edgecdnxv1alpha1.PrefixList, ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
-	if !prefixList.ObjectMeta.DeletionTimestamp.IsZero() {
-		// The object is being deleted
-		if controllerutil.ContainsFinalizer(prefixList, PrefixListFinalizer) {
-			log.Info("Deleting Controller managed PrefixList. This is not really a common operation. We will request a recalculation of the prefix list")
-			controllerutil.RemoveFinalizer(prefixList, PrefixListFinalizer)
-
-			err := r.Update(ctx, prefixList)
-			if err != nil {
-				log.Error(err, "Failed to remove finalizer")
-				return ctrl.Result{}, err
-			}
-
-			return ctrl.Result{Requeue: true}, nil
-		}
+	if !appsetFound.DeletionTimestamp.IsZero() {
+		log.Info("ApplicationSet is being deleted. Skipping reconciliation")
+		return ctrl.Result{}, nil
 	}
 
-	if prefixList.Status != (edgecdnxv1alpha1.PrefixListStatus{}) {
-		if prefixList.Status.Status == HealthStatusProgressing && prefixList.Status.ConsoliadtionStatus == ConsoliadtionStatusRequested {
-			log.Info("Prefix Recalculation requested for Controller managed PrefixList")
-
-			prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
-				Status:              HealthStatusProgressing,
-				ConsoliadtionStatus: ConsoliadtionStatusConsolidating,
-			}
-
-			err := r.Status().Update(context.Background(), prefixList)
-			if err != nil {
-				log.Error(err, "Failed to update PrefixList status")
-				return ctrl.Result{}, err
-			}
-
-			prefixListList := &edgecdnxv1alpha1.PrefixListList{}
-			err = r.List(ctx, prefixListList, client.InNamespace(req.Namespace))
-
-			if err != nil {
-				log.Error(err, "Failed to list PrefixList")
-				return ctrl.Result{}, err
-			}
-
-			v4Prefixes := make([]edgecdnxv1alpha1.V4Prefix, 0)
-			// v6Prefixes := make([]edgecdnxv1alpha1.V6Prefix, 0)
-			for _, prefix := range prefixListList.Items {
-				if prefix.Spec.Source != SourceController && prefix.Spec.Destination == prefixList.Spec.Destination {
-					v4Prefixes = append(v4Prefixes, prefix.Spec.Prefix.V4...)
-					// v6Prefixes = append(v6Prefixes, prefix.Spec.Prefix.V6...)
-				}
-			}
-
-			newPrefixes, err := consolidation.ConsolidateV4(ctx, v4Prefixes)
-			if err != nil {
-				log.Error(err, "Failed to consolidate prefixes")
-				return ctrl.Result{}, err
-			}
-			prefixList.Spec.Prefix.V4 = newPrefixes
-
-			err = r.Update(ctx, prefixList)
-			if err != nil {
-				log.Error(err, "Failed to update PrefixList")
-				return ctrl.Result{}, err
-			}
-
-			prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
-				Status:              HealthStatusProgressing,
-				ConsoliadtionStatus: ConsoliadtionStatusConsolidated,
-			}
-
-			err = r.Status().Update(context.Background(), prefixList)
-			if err != nil {
-				log.Error(err, "Failed to update PrefixList status")
-				return ctrl.Result{}, err
-			}
-
-			return ctrl.Result{}, nil
-		}
-		if prefixList.Status.Status == HealthStatusProgressing && prefixList.Status.ConsoliadtionStatus == ConsoliadtionStatusConsolidating {
-			log.Info("Prefix Recalculation in progress Skipping reconciliation")
-			return ctrl.Result{}, nil
-		}
-		if prefixList.Status.Status == HealthStatusProgressing && prefixList.Status.ConsoliadtionStatus == ConsoliadtionStatusConsolidated {
-			log.Info("Prefix Recalculation completed for Controller managed PrefixList")
-			prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
-				Status:              HealthStatusHealthy,
-				ConsoliadtionStatus: ConsoliadtionStatusConsolidated,
-			}
-
-			err := r.Status().Update(context.Background(), prefixList)
-			if err != nil {
-				log.Error(err, "Failed to update PrefixList status")
-				return ctrl.Result{}, err
-			}
-		}
-		if prefixList.Status.Status == HealthStatusHealthy && prefixList.Status.ConsoliadtionStatus == ConsoliadtionStatusConsolidated {
-			log.Info("PrefixList is healthy, Rolling it out via Argocd")
-
-			return r.reconcileArgocdApplicationSet(prefixList, ctx, req)
-		}
-	} else {
-		prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
-			Status:              HealthStatusProgressing,
-			ConsoliadtionStatus: ConsoliadtionStatusRequested,
-		}
-
-		err := r.Status().Update(context.Background(), prefixList)
-		if err != nil {
-			log.Error(err, "Failed to update PrefixList status")
-			return ctrl.Result{}, err
-		}
+	appsetHash, ok := appsetFound.ObjectMeta.Labels["edgecdnx.com/config-md5"]
+	if ok && appsetHash == fmt.Sprintf("%x", hash) {
+		log.Info("ApplicationSet already exists for destination with the correct config (md5-hash). Skipping reconciliation")
+		return ctrl.Result{}, nil
 	}
 
-	return ctrl.Result{}, nil
+	appsetFound.ObjectMeta.Labels["edgecdnx.com/config-md5"] = fmt.Sprintf("%x", hash)
+	appsetFound.Spec = specObj
+
+	return ctrl.Result{}, r.Update(ctx, appsetFound)
 }
 
 func (r *PrefixListReconciler) handleUserPrefixList(prefixList *edgecdnxv1alpha1.PrefixList, ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	// Static and BGP Chain
-	generatedName := fmt.Sprintf("%s-%s", prefixList.Spec.Destination, "generated")
-
-	if !prefixList.ObjectMeta.DeletionTimestamp.IsZero() {
-		// The object is being deleted
-		if controllerutil.ContainsFinalizer(prefixList, PrefixListFinalizer) {
-			log.Info("Deleting PrefixList")
-			controllerutil.RemoveFinalizer(prefixList, PrefixListFinalizer)
-			err := r.Update(ctx, prefixList)
-			if err != nil {
-				log.Error(err, "Failed to remove finalizer")
-				return ctrl.Result{}, err
-			}
-		}
-
-		// Make sure we call the regeneration
-		generatedPrefixList := &edgecdnxv1alpha1.PrefixList{}
-		err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: generatedName}, generatedPrefixList)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-
-		generatedPrefixList.Status.Status = HealthStatusProgressing
-		generatedPrefixList.Status.ConsoliadtionStatus = ConsoliadtionStatusRequested
-		err = r.Status().Update(context.Background(), generatedPrefixList)
-		if err != nil {
-			log.Error(err, "Failed to update status of generated PrefixList")
-			return ctrl.Result{}, err
-		}
-
-		return ctrl.Result{}, nil
-	}
-
 	if prefixList.Status != (edgecdnxv1alpha1.PrefixListStatus{}) {
+		// With status
+		// If healthy, nothing to do
+		// If not healthy, we need to update the status
+
 		if prefixList.Status.Status == HealthStatusHealthy {
+			log.Info("PrefixList is healthy.")
+
+			generatedName := fmt.Sprintf("%s-%s", prefixList.Spec.Destination, "generated")
+
 			generatedPrefixList := &edgecdnxv1alpha1.PrefixList{}
 			// Find object by destination. We are consolidating the prefix list here
 			err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: generatedName}, generatedPrefixList)
@@ -285,6 +186,9 @@ func (r *PrefixListReconciler) handleUserPrefixList(prefixList *edgecdnxv1alpha1
 					ObjectMeta: ctrl.ObjectMeta{
 						Name:      generatedName,
 						Namespace: req.Namespace,
+						Labels: map[string]string{
+							"edgecdnx.com/config-md5": "",
+						},
 					},
 					Spec: edgecdnxv1alpha1.PrefixListSpec{
 						Source: SourceController,
@@ -296,89 +200,122 @@ func (r *PrefixListReconciler) handleUserPrefixList(prefixList *edgecdnxv1alpha1
 					},
 				}
 
-				if !controllerutil.ContainsFinalizer(nPrefixList, PrefixListFinalizer) {
-					controllerutil.AddFinalizer(nPrefixList, PrefixListFinalizer)
-				}
-
-				err := r.Create(ctx, nPrefixList)
-
-				if err != nil {
-					log.Error(err, "Failed to create PrefixList")
-					return ctrl.Result{}, err
-				}
-
-				log.Info("PrefixList created for destination")
-				return ctrl.Result{}, nil
+				controllerutil.SetOwnerReference(prefixList, nPrefixList, r.Scheme)
+				return ctrl.Result{}, r.Create(ctx, nPrefixList)
 			} else {
-				log.Info("PrefixList already exists for destination, Triggering Reconciliation")
-				// Update the consolidated prefix list with the new prefixes
-				generatedPrefixList.Status.Status = HealthStatusProgressing
-				generatedPrefixList.Status.ConsoliadtionStatus = ConsoliadtionStatusRequested
 
-				err := r.Status().Update(context.Background(), generatedPrefixList)
-				if err != nil {
-					return ctrl.Result{}, err
+				if !generatedPrefixList.DeletionTimestamp.IsZero() {
+					log.Info("Generated PrefixList is being deleted. Skipping reconciliation")
+
+					return ctrl.Result{}, nil
+				}
+
+				containsOwnerReference := false
+				for _, ownerRef := range generatedPrefixList.OwnerReferences {
+					if ownerRef.UID == prefixList.UID {
+						containsOwnerReference = true
+						break
+					}
+				}
+
+				if !containsOwnerReference {
+					log.Info("Prefixlist exists for destination. Adding OwnerReference to generated PrefixList")
+					controllerutil.SetOwnerReference(prefixList, generatedPrefixList, r.Scheme)
+					r.Update(ctx, generatedPrefixList)
 				}
 
 				return ctrl.Result{}, nil
 			}
 		}
-	}
+		if prefixList.Status.Status == HealthStatusProgressing {
+			log.Info("PrefixList is in progress.")
 
-	log.Info("PrefixList status is nil, resource just created. Setting status to Healthy")
-	prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
-		Status: HealthStatusHealthy,
-	}
-
-	err := r.Status().Update(context.Background(), prefixList)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if !controllerutil.ContainsFinalizer(prefixList, PrefixListFinalizer) {
-		controllerutil.AddFinalizer(prefixList, PrefixListFinalizer)
-		err = r.Update(ctx, prefixList)
-		if err != nil {
-			log.Error(err, "Failed to add finalizer")
-			return ctrl.Result{}, err
+			prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
+				Status: HealthStatusHealthy,
+			}
+			return ctrl.Result{}, r.Status().Update(ctx, prefixList)
 		}
+	} else {
+		// No Status
+		// Adding one
+		prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
+			Status: HealthStatusHealthy,
+		}
+		return ctrl.Result{}, r.Status().Update(ctx, prefixList)
 	}
 
 	return ctrl.Result{}, nil
-
 }
 
-func (r *PrefixListReconciler) forceSync(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *PrefixListReconciler) handleControllerPrefixList(prefixList *edgecdnxv1alpha1.PrefixList, ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	log.Info("Running triggers, see if we need to trigger a regeneration")
-	prefixListList := &edgecdnxv1alpha1.PrefixListList{}
-	err := r.List(ctx, prefixListList, client.InNamespace(req.Namespace))
+	v4Prefixes := make([]edgecdnxv1alpha1.V4Prefix, 0)
+	v6Prefixes := make([]edgecdnxv1alpha1.V6Prefix, 0)
 
-	if err != nil {
-		log.Error(err, "Failed to list PrefixList")
-		return ctrl.Result{}, err
-	}
-
-	notFoundList := make([]string, 0)
-
-	for _, prefixList := range prefixListList.Items {
-		if prefixList.Spec.Source != SourceController {
-
-			if !slices.ContainsFunc(prefixListList.Items, func(item edgecdnxv1alpha1.PrefixList) bool {
-				return item.Spec.Source == SourceController && prefixList.Spec.Destination == item.Spec.Destination && !slices.Contains(notFoundList, prefixList.Spec.Destination)
-			}) {
-				notFoundList = append(notFoundList, prefixList.Spec.Destination)
-				prefixList.Status.Status = HealthStatusProgressing
-				err = r.Status().Update(context.Background(), &prefixList)
-				if err != nil {
-					return ctrl.Result{}, err
-				}
+	for _, ownerRes := range prefixList.OwnerReferences {
+		if ownerRes.Kind == "PrefixList" {
+			log.Info(fmt.Sprintf("%v", ownerRes))
+			ownerPrefixList := &edgecdnxv1alpha1.PrefixList{}
+			err := r.Get(ctx, types.NamespacedName{Namespace: req.Namespace, Name: ownerRes.Name}, ownerPrefixList)
+			if err != nil {
+				log.Error(err, "Failed to get Owner PrefixList")
+				return ctrl.Result{}, err
 			}
+
+			if ownerPrefixList.Status.Status != HealthStatusHealthy {
+				log.Info("Owner PrefixList is in progress. Waiting for it to be healthy")
+				return ctrl.Result{}, nil
+			}
+
+			v4Prefixes = append(v4Prefixes, ownerPrefixList.Spec.Prefix.V4...)
+			v6Prefixes = append(v6Prefixes, ownerPrefixList.Spec.Prefix.V6...)
 		}
 	}
 
-	return ctrl.Result{}, nil
+	newPrefixesV4, err := consolidation.ConsolidateV4(ctx, v4Prefixes)
+	if err != nil {
+		log.Error(err, "Failed to consolidate prefixes")
+		return ctrl.Result{}, err
+	}
+	newPrefixesV6 := v6Prefixes
+
+	newPrefix := edgecdnxv1alpha1.Prefix{
+		V4: newPrefixesV4,
+		V6: newPrefixesV6,
+	}
+
+	prefixByteA, err := json.Marshal(newPrefix)
+	if err != nil {
+		log.Error(err, "Failed to marshal prefix object")
+		return ctrl.Result{}, err
+	}
+	newmd5Hash := md5.Sum(prefixByteA)
+	log.Info(fmt.Sprintf("New md5 hash: %x", newmd5Hash))
+	curHash, ok := prefixList.ObjectMeta.Labels["edgecdnx.com/config-md5"]
+
+	if ok {
+		log.Info(fmt.Sprintf("Current md5 hash: %s", curHash))
+	}
+
+	if ok && curHash == fmt.Sprintf("%x", newmd5Hash) {
+
+		log.Info("PrefixList already exists for destination with the correct config (md5-hash).")
+
+		prefixList.Status = edgecdnxv1alpha1.PrefixListStatus{
+			Status:              HealthStatusHealthy,
+			ConsoliadtionStatus: ConsoliadtionStatusConsolidated,
+		}
+
+		r.Status().Update(context.Background(), prefixList)
+
+		return r.reconcileArgocdApplicationSet(prefixList, ctx, req)
+	}
+
+	prefixList.ObjectMeta.Labels["edgecdnx.com/config-md5"] = fmt.Sprintf("%x", newmd5Hash)
+	prefixList.Spec.Prefix = newPrefix
+
+	return ctrl.Result{}, r.Update(ctx, prefixList)
 }
 
 // +kubebuilder:rbac:groups=edgecdnx.edgecdnx.com,resources=prefixlists,verbs=get;list;watch;create;update;patch;delete
@@ -405,7 +342,7 @@ func (r *PrefixListReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Info("PrefixList resource not found. Ignoring since object must be deleted.")
-			return r.forceSync(ctx, req)
+			return ctrl.Result{}, nil
 		}
 		log.Error(err, "Failed to get PrefixList")
 		return ctrl.Result{}, err
@@ -427,5 +364,6 @@ func (r *PrefixListReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&edgecdnxv1alpha1.PrefixList{}).
 		Owns(&argoprojv1alpha1.ApplicationSet{}).
+		Owns(&edgecdnxv1alpha1.PrefixList{}, builder.MatchEveryOwner).
 		Complete(r)
 }

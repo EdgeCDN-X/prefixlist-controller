@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sort"
 
 	edgecdnxv1alpha1 "edgecdnx.com/prefixlist-controller/api/v1alpha1"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -11,7 +12,6 @@ import (
 
 func ConsolidateV4(ctx context.Context, prefixes []edgecdnxv1alpha1.V4Prefix) ([]edgecdnxv1alpha1.V4Prefix, error) {
 	log := logf.FromContext(ctx)
-	log.Info("Consolidating Prefixes")
 
 	for prefixlen := 31; prefixlen > 1; prefixlen-- {
 		// Iterating over all prefixes with descending prefix length
@@ -69,7 +69,6 @@ func ConsolidateV4(ctx context.Context, prefixes []edgecdnxv1alpha1.V4Prefix) ([
 
 		for key, val := range consolidables {
 			if len(val.prefixes) > 1 {
-				log.Info("Consolidating Prefixes", "Target Subnet", key, "Source Subnets", val.prefixes)
 
 				_, newPrefix, err := net.ParseCIDR(key)
 				if err != nil {
@@ -86,9 +85,6 @@ func ConsolidateV4(ctx context.Context, prefixes []edgecdnxv1alpha1.V4Prefix) ([
 			}
 		}
 	}
-
-	log.Info("Consolidated Prefixes", "Result", prefixes)
-	log.Info("Finding supernets")
 
 	toBeDeleted := make(map[string]edgecdnxv1alpha1.V4Prefix, 0)
 
@@ -134,6 +130,14 @@ func ConsolidateV4(ctx context.Context, prefixes []edgecdnxv1alpha1.V4Prefix) ([
 			keepPrefixes = append(keepPrefixes, prefix)
 		}
 	}
+
+	sort.Slice(keepPrefixes, func(i, j int) bool {
+		ipi, _, _ := net.ParseCIDR(keepPrefixes[i].Address + "/" + fmt.Sprint(keepPrefixes[i].Size))
+		ipj, _, _ := net.ParseCIDR(keepPrefixes[j].Address + "/" + fmt.Sprint(keepPrefixes[j].Size))
+
+		return ipi.String() < ipj.String()
+	})
+
 	log.Info("Consolidated Prefixes", "Result", keepPrefixes)
 
 	return keepPrefixes, nil
